@@ -23,6 +23,14 @@ import java.util.List;
 import java.util.concurrent.locks.ReentrantLock;
 
 public class GLTextManager extends GLTextRendererBase {
+    private static Typeface getSafeMonospace() {
+        try {
+            return Typeface.MONOSPACE;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     private class Line {
         private final String mText;
         private final int mColor;
@@ -87,7 +95,7 @@ public class GLTextManager extends GLTextRendererBase {
     }
 
     public GLTextManager(GLTextureManager textureManager, GLHelper helper, int left, int top, int width, int height, int maxHeight, int lineHeight) {
-        super(textureManager, helper, Typeface.MONOSPACE, lineHeight);
+        super(textureManager, helper, getSafeMonospace(), lineHeight);
         resize(left, top, width, height, maxHeight, lineHeight);
     }
 

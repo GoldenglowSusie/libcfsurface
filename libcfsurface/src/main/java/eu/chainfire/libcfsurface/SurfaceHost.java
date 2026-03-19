@@ -76,30 +76,222 @@ public abstract class SurfaceHost {
     private Method mTransactionSetLayer = null;
     private Method mTransactionSetBufferSize = null;
 
+    private static final class DisplaySelection {
+        public final IBinder token;
+        public final Object[] displayConfigs;
+
+        public DisplaySelection(IBinder token, Object[] displayConfigs) {
+            this.token = token;
+            this.displayConfigs = displayConfigs;
+        }
+    }
+
+    private static long getArea(int width, int height) {
+        return (long) width * (long) height;
+    }
+
+    private static boolean isBetterDimensions(int width, int height, int bestWidth, int bestHeight) {
+        if (width <= 0 || height <= 0) return false;
+        long candidateArea = getArea(width, height);
+        long bestArea = getArea(bestWidth, bestHeight);
+        return (candidateArea > bestArea) ||
+                ((candidateArea == bestArea) && ((width > bestWidth) || ((width == bestWidth) && (height > bestHeight))));
+    }
+
+    private Display getPreferredDisplay() {
+        try {
+            if (mDisplayManager == null) {
+                mDisplayManager = (DisplayManager) mContext.getSystemService(Context.DISPLAY_SERVICE);
+            }
+            if (mDisplayManager == null) return null;
+
+            Display bestDisplay = null;
+            int bestWidth = 0;
+            int bestHeight = 0;
+
+            Display defaultDisplay = mDisplayManager.getDisplay(Display.DEFAULT_DISPLAY);
+            if (defaultDisplay != null) {
+                Point size = new Point();
+                defaultDisplay.getRealSize(size);
+                if (size.x > 0 && size.y > 0) {
+                    return defaultDisplay;
+                }
+            }
+
+            Display[] displays = mDisplayManager.getDisplays();
+            if (displays != null) {
+                for (Display display : displays) {
+                    if (display == null) continue;
+                    Point size = new Point();
+                    display.getRealSize(size);
+                    if (isBetterDimensions(size.x, size.y, bestWidth, bestHeight)) {
+                        bestDisplay = display;
+                        bestWidth = size.x;
+                        bestHeight = size.y;
+                    }
+                }
+            }
+
+            return bestDisplay;
+        } catch (Exception e) {
+            // there will be exceptions during boot-up while DisplayManager isn't ready yet
+        }
+        return null;
+    }
+
+    private Point getLargestDisplayConfigSize(Object[] displayConfigs) throws Exception {
+        Point best = new Point(0, 0);
+        if (displayConfigs == null) return best;
+
+        Field fWidth = null;
+        Field fHeight = null;
+        for (Object displayConfig : displayConfigs) {
+            if (displayConfig == null) continue;
+            if (fWidth == null || fHeight == null) {
+                Class<?> cDisplayConfig = displayConfig.getClass();
+                @SuppressLint("BlockedPrivateApi") Field widthField = cDisplayConfig.getDeclaredField("width");
+                @SuppressLint("BlockedPrivateApi") Field heightField = cDisplayConfig.getDeclaredField("height");
+                widthField.setAccessible(true);
+                heightField.setAccessible(true);
+                fWidth = widthField;
+                fHeight = heightField;
+            }
+            int width = fWidth.getInt(displayConfig);
+            int height = fHeight.getInt(displayConfig);
+            if (isBetterDimensions(width, height, best.x, best.y)) {
+                best.set(width, height);
+            }
+        }
+        return best;
+    }
+
+    private Object[] getDisplayConfigs(Class<?> cSurfaceControl, IBinder displayToken, Long physicalDisplayId) throws Exception {
+        if ((displayToken != null) && (Build.VERSION.SDK_INT <= 30)) {
+            try {
+                Method mGetDisplayConfigs = cSurfaceControl.getDeclaredMethod("getDisplayConfigs", IBinder.class);
+                Object[] displayConfigs = (Object[]) mGetDisplayConfigs.invoke(null, displayToken);
+                if (displayConfigs != null && displayConfigs.length > 0) {
+                    return displayConfigs;
+                }
+            } catch (NoSuchMethodException e) {
+            }
+        }
+
+        if (displayToken != null) {
+            try {
+                Method mGetDynamicDisplayInfo = cSurfaceControl.getDeclaredMethod("getDynamicDisplayInfo", IBinder.class);
+                Object dynamicDisplayInfo = mGetDynamicDisplayInfo.invoke(null, displayToken);
+                Object[] displayConfigs = getSupportedDisplayModes(dynamicDisplayInfo);
+                if (displayConfigs != null && displayConfigs.length > 0) {
+                    return displayConfigs;
+                }
+            } catch (NoSuchMethodException e) {
+            }
+        }
+
+        if (physicalDisplayId != null) {
+            try {
+                Method mGetDynamicDisplayInfo = cSurfaceControl.getDeclaredMethod("getDynamicDisplayInfo", long.class);
+                Object dynamicDisplayInfo = mGetDynamicDisplayInfo.invoke(null, physicalDisplayId.longValue());
+                Object[] displayConfigs = getSupportedDisplayModes(dynamicDisplayInfo);
+                if (displayConfigs != null && displayConfigs.length > 0) {
+                    return displayConfigs;
+                }
+            } catch (NoSuchMethodException e) {
+            }
+        }
+
+        return null;
+    }
+
+    private Object[] getSupportedDisplayModes(Object dynamicDisplayInfo) throws Exception {
+        if (dynamicDisplayInfo == null) return null;
+        Class<?> cDynamicDisplayInfo = dynamicDisplayInfo.getClass();
+        @SuppressLint("BlockedPrivateApi") Field fSupportedDisplayModes = cDynamicDisplayInfo.getDeclaredField("supportedDisplayModes");
+        fSupportedDisplayModes.setAccessible(true);
+        return (Object[]) fSupportedDisplayModes.get(dynamicDisplayInfo);
+    }
+
+    private DisplaySelection getBestDisplaySelection(Class<?> cSurfaceControl) throws Exception {
+        IBinder bestDisplayToken = null;
+        Object[] bestDisplayConfigs = null;
+        int bestWidth = 0;
+        int bestHeight = 0;
+
+        try {
+            Method mGetBuiltInDisplay = cSurfaceControl.getDeclaredMethod("getBuiltInDisplay", int.class);
+            IBinder builtInDisplay = (IBinder) mGetBuiltInDisplay.invoke(null, 0 /* SurfaceControl.BUILT_IN_DISPLAY_ID_MAIN */);
+            Object[] displayConfigs = getDisplayConfigs(cSurfaceControl, builtInDisplay, null);
+            Point size = getLargestDisplayConfigSize(displayConfigs);
+            if (isBetterDimensions(size.x, size.y, bestWidth, bestHeight)) {
+                bestDisplayToken = builtInDisplay;
+                bestDisplayConfigs = displayConfigs;
+                bestWidth = size.x;
+                bestHeight = size.y;
+            }
+        } catch (NoSuchMethodException e) {
+        } catch (Exception e) {
+            Logger.ex(e);
+        }
+
+        try {
+            Method mGetPhysicalDisplayIds = cSurfaceControl.getDeclaredMethod("getPhysicalDisplayIds");
+            long[] ids = (long[]) mGetPhysicalDisplayIds.invoke(null);
+            Method mGetPhysicalDisplayToken = cSurfaceControl.getDeclaredMethod("getPhysicalDisplayToken", long.class);
+            if (ids != null) {
+                for (long id : ids) {
+                    try {
+                        IBinder displayToken = (IBinder) mGetPhysicalDisplayToken.invoke(null, id);
+                        Object[] displayConfigs = getDisplayConfigs(cSurfaceControl, displayToken, id);
+                        Point size = getLargestDisplayConfigSize(displayConfigs);
+                        if (isBetterDimensions(size.x, size.y, bestWidth, bestHeight)) {
+                            bestDisplayToken = displayToken;
+                            bestDisplayConfigs = displayConfigs;
+                            bestWidth = size.x;
+                            bestHeight = size.y;
+                        }
+                    } catch (Exception e) {
+                        Logger.ex(e);
+                    }
+                }
+            }
+        } catch (NoSuchMethodException e) {
+        }
+
+        if (bestDisplayConfigs == null) {
+            try {
+                Object[] displayConfigs = getDisplayConfigs(cSurfaceControl, null, 0L);
+                Point size = getLargestDisplayConfigSize(displayConfigs);
+                if (isBetterDimensions(size.x, size.y, bestWidth, bestHeight)) {
+                    bestDisplayConfigs = displayConfigs;
+                }
+            } catch (Exception e) {
+                Logger.ex(e);
+            }
+        }
+
+        return new DisplaySelection(bestDisplayToken, bestDisplayConfigs);
+    }
+
     private final boolean checkRotation() {
         // This is fairly weird construct only because we need to handle the case of (for example)
         // LiveBoot running while Android really isn't started up yet. It would normally be much
         // easier to use WindowManager::getDefaultDisplay(), but that will bring down the process
         // in that specific case.
         try {
-            if (mDisplayManager == null) {
-                mDisplayManager = (DisplayManager) mContext.getSystemService(Context.DISPLAY_SERVICE);
-            }
-            if (mDisplayManager != null) {
-                Display[] displays = mDisplayManager.getDisplays();
-                if ((displays != null) && (displays.length > 0)) {
-                    int rotation = mDisplayManager.getDisplay(0).getRotation();
-                    if (rotation != mLastRotation) {
-                        boolean neutral = (rotation == Surface.ROTATION_0) || (rotation == Surface.ROTATION_180);
-                        boolean lastNeutral = (mLastRotation == Surface.ROTATION_0) || (mLastRotation == Surface.ROTATION_180);
-                        mLastRotation = rotation;
-                        if (neutral != lastNeutral) {
-                            int swap = mWidth;
-                            mWidth = mHeight;
-                            mHeight = swap;
-                            updateSurfaceSize();
-                            return true;
-                        }
+            Display display = getPreferredDisplay();
+            if (display != null) {
+                int rotation = display.getRotation();
+                if (rotation != mLastRotation) {
+                    boolean neutral = (rotation == Surface.ROTATION_0) || (rotation == Surface.ROTATION_180);
+                    boolean lastNeutral = (mLastRotation == Surface.ROTATION_0) || (mLastRotation == Surface.ROTATION_180);
+                    mLastRotation = rotation;
+                    if (neutral != lastNeutral) {
+                        int swap = mWidth;
+                        mWidth = mHeight;
+                        mHeight = swap;
+                        updateSurfaceSize();
+                        return true;
                     }
                 }
             }
@@ -116,19 +308,13 @@ public abstract class SurfaceHost {
         // This doesn't actually help during boot though, because by the time the DisplayManager
         // gets registered by system_server we're up and booted
         try {
-            if (mDisplayManager == null) {
-                mDisplayManager = (DisplayManager) mContext.getSystemService(Context.DISPLAY_SERVICE);
-            }
-            if (mDisplayManager != null) {
-                Display[] displays = mDisplayManager.getDisplays();
-                if ((displays != null) && (displays.length > 0)) {
-                    Display display = mDisplayManager.getDisplay(0);
-                    Class<?> cDisplayInfo = Class.forName("android.view.DisplayInfo");
-                    Method getDisplayInfo = Display.class.getDeclaredMethod("getDisplayInfo", cDisplayInfo);
-                    Object displayInfo = cDisplayInfo.newInstance();
-                    getDisplayInfo.invoke(display, displayInfo);
-                    mWidth = cDisplayInfo.getDeclaredField("logicalWidth").getInt(displayInfo);
-                    mHeight = cDisplayInfo.getDeclaredField("logicalHeight").getInt(displayInfo);
+            Display display = getPreferredDisplay();
+            if (display != null) {
+                Point realSize = new Point();
+                display.getRealSize(realSize);
+                if (realSize.x > 0 && realSize.y > 0) {
+                    mWidth = realSize.x;
+                    mHeight = realSize.y;
                     checkRotation();
                 }
             }
@@ -154,55 +340,9 @@ public abstract class SurfaceHost {
             // Get display configuration
             cSurfaceControl = Class.forName("android.view.SurfaceControl");
 
-            IBinder mBuiltInDisplay = null;
-            try {
-                // API 28-
-                Method mGetBuiltInDisplay = cSurfaceControl.getDeclaredMethod("getBuiltInDisplay", int.class);
-                mBuiltInDisplay = (IBinder)mGetBuiltInDisplay.invoke(null,0 /* SurfaceControl.BUILT_IN_DISPLAY_ID_MAIN */);
-            } catch (NoSuchMethodException e) {
-            }
-            if (mBuiltInDisplay == null) {
-                // API 29-33
-                try {
-                    Method mGetPhysicalDisplayIds = cSurfaceControl.getDeclaredMethod("getPhysicalDisplayIds");
-                    long[] ids = (long[])mGetPhysicalDisplayIds.invoke(null);
-                    Method mGetPhysicalDisplayToken = cSurfaceControl.getDeclaredMethod("getPhysicalDisplayToken", long.class);
-                    mBuiltInDisplay = (IBinder)mGetPhysicalDisplayToken.invoke(null, ids[0]);
-                } catch (NoSuchMethodException e) {
-                }
-            }
-
-            Method mGetDisplayConfigs;
-            Object[] displayConfigs = null;
-            if (Build.VERSION.SDK_INT <= 30) {
-                // API 30-
-                mGetDisplayConfigs = cSurfaceControl.getDeclaredMethod("getDisplayConfigs", IBinder.class);
-                displayConfigs = (Object[]) mGetDisplayConfigs.invoke(null, mBuiltInDisplay);
-            }
-            if (displayConfigs == null && mBuiltInDisplay != null) {
-                // API 31-33, though mBuiltInDisplay is actually defined on some weird API 34's like Samsung
-                try {
-                    Method mGetDynamicDisplayInfo = cSurfaceControl.getDeclaredMethod("getDynamicDisplayInfo", IBinder.class);
-                    Object dynamicDisplayInfo = mGetDynamicDisplayInfo.invoke(null, mBuiltInDisplay);
-                    if (dynamicDisplayInfo != null) {
-                        Class<?> cDynamicDisplayInfo = Class.forName("android.view.SurfaceControl$DynamicDisplayInfo");
-                        @SuppressLint("BlockedPrivateApi") Field fSsupportedDisplayModes = cDynamicDisplayInfo.getDeclaredField("supportedDisplayModes");
-                        displayConfigs = (Object[]) fSsupportedDisplayModes.get(dynamicDisplayInfo);
-                    }
-                } catch (NoSuchMethodException e) {
-                }
-            }
-            if (displayConfigs == null) {
-                // API 34+
-                Method mGetDynamicDisplayInfo = cSurfaceControl.getDeclaredMethod("getDynamicDisplayInfo", long.class);
-                Object dynamicDisplayInfo = mGetDynamicDisplayInfo.invoke(null, 0);
-                if (dynamicDisplayInfo != null) {
-                    Class<?> cDynamicDisplayInfo = Class.forName("android.view.SurfaceControl$DynamicDisplayInfo");
-                    @SuppressLint("BlockedPrivateApi") Field fSsupportedDisplayModes = cDynamicDisplayInfo.getDeclaredField("supportedDisplayModes");
-                    displayConfigs = (Object[]) fSsupportedDisplayModes.get(dynamicDisplayInfo);
-                }
-                // not catching NoSuchMethodException as canary for API changes
-            }
+            DisplaySelection displaySelection = getBestDisplaySelection(cSurfaceControl);
+            IBinder mBuiltInDisplay = displaySelection.token;
+            Object[] displayConfigs = displaySelection.displayConfigs;
 
             if (displayConfigs == null) {
                 checkDimensions();
@@ -215,30 +355,8 @@ public abstract class SurfaceHost {
                     }
                 }
             } else if (mWidth <= 0 || mHeight <= 0) {
-                Class<?> cPhysicalDisplayInfo = null;
-                // API 29-
-                try {
-                    cPhysicalDisplayInfo = Class.forName("android.view.SurfaceControl$PhysicalDisplayInfo");
-                } catch (ClassNotFoundException e) {
-                }
-                // API 30
-                if (cPhysicalDisplayInfo == null) {
-                    try {
-                        cPhysicalDisplayInfo = Class.forName("android.view.SurfaceControl$DisplayConfig");
-                    } catch (ClassNotFoundException e) {
-                    }
-                }
-                // API 31+
-                if (cPhysicalDisplayInfo == null) {
-                    try {
-                        cPhysicalDisplayInfo = Class.forName("android.view.SurfaceControl$DisplayMode");
-                    } catch (ClassNotFoundException e) {
-                    }
-                }
-
-                @SuppressLint("BlockedPrivateApi") Field fWidth = cPhysicalDisplayInfo.getDeclaredField("width");
-                @SuppressLint("BlockedPrivateApi") Field fHeight = cPhysicalDisplayInfo.getDeclaredField("height");
-                if ((displayConfigs == null) || (displayConfigs.length == 0)) {
+                Point bestDisplaySize = getLargestDisplayConfigSize(displayConfigs);
+                if ((displayConfigs == null) || (displayConfigs.length == 0) || bestDisplaySize.x <= 0 || bestDisplaySize.y <= 0) {
                     if (fallbackWidth > 0 && fallbackHeight > 0) {
                         mWidth = fallbackWidth;
                         mHeight = fallbackHeight;
@@ -246,8 +364,8 @@ public abstract class SurfaceHost {
                         throw new RuntimeException("CFSurface: could not determine screen dimensions (SurfaceControl)");
                     }
                 } else {
-                    mWidth = fWidth.getInt(displayConfigs[0]);
-                    mHeight = fHeight.getInt(displayConfigs[0]);
+                    mWidth = bestDisplaySize.x;
+                    mHeight = bestDisplaySize.y;
                 }
                 checkRotation();
             }
@@ -379,13 +497,20 @@ public abstract class SurfaceHost {
 
             if (mSurfaceControlGetGlobalTransaction != null || mTransaction != null) {
                 // API 31+
-                Class<?> cTypeface = Class.forName("android.graphics.Typeface");
-                @SuppressLint("BlockedPrivateApi") Method mGetDefault = cTypeface.getDeclaredMethod("getDefault");
-                mGetDefault.setAccessible(true);
+                try {
+                    Class<?> cTypeface = Class.forName("android.graphics.Typeface");
+                    @SuppressLint("BlockedPrivateApi") Method mGetDefault = cTypeface.getDeclaredMethod("getDefault");
+                    mGetDefault.setAccessible(true);
 
-                if (mGetDefault.invoke(null) == null) {
-                    @SuppressLint("BlockedPrivateApi") Method mLoadPreinstalledSystemFontMap = cTypeface.getDeclaredMethod("loadPreinstalledSystemFontMap");
-                    mLoadPreinstalledSystemFontMap.invoke(null);
+                    if (mGetDefault.invoke(null) == null) {
+                        @SuppressLint("BlockedPrivateApi") Method mLoadPreinstalledSystemFontMap = cTypeface.getDeclaredMethod("loadPreinstalledSystemFontMap");
+                        mLoadPreinstalledSystemFontMap.invoke(null);
+                    }
+                } catch (Exception e) {
+                    // Some vendor ROMs can route font loading through Settings-backed code paths
+                    // that are unavailable in this early root context. Rendering can continue
+                    // with the framework fallback font, so don't abort surface setup here.
+                    Logger.ex(e);
                 }
             }
 
